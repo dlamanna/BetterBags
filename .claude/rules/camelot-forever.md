@@ -151,7 +151,69 @@ Coverage: `spec/frames/bagslots_spec.lua` ("centers the bags with symmetric padd
 Camelot") and `spec/frames/bankslots_spec.lua` ("Camelot headerless decoration": bypasses the
 themed flat window on Camelot, still uses it on ordinary retail).
 
-## 6. Still pending (not yet done)
+## 6. Equipment-set scan routes by API existence, not TOC version
+
+`data/equipmentsets.lua` has two harvest implementations: `UpdatePreMidnight` (uses
+`EquipmentManager_UnpackLocation`) and `UpdateMidnight` (uses `EquipmentManager_GetLocationData`,
+the API 12.0/Midnight introduced when it removed `UnpackLocation`). The dispatcher in
+`equipmentSets:Update()` originally chose between them with the version gate
+`addon.isMidnight` (`addon.isRetail and tocVersion >= 120000`, `core/constants.lua`).
+
+Camelot is a mainline fork that already ships the Midnight `EquipmentManager` — only
+`GetLocationData`, no `UnpackLocation` — yet reports a **sub-12.0 TOC** (Interface `16001`), so
+`addon.isMidnight` is `false` on Forever. The version gate therefore routed Forever to
+`UpdatePreMidnight`, which called the non-existent `EquipmentManager_UnpackLocation` and crashed
+with `attempt to call a nil value` (triggered by `CreateEquipmentSet` → `EQUIPMENT_SETS_CHANGED`
+→ `refresh:RequestUpdate` → `equipmentSets:Update`). This is the same lesson as §1: **no version
+number distinguishes Forever from other clients** — here it also fails to distinguish which
+EquipmentManager API is present.
+
+Fix: `Update()` selects the implementation by **feature detection**, preferring the old API
+where it exists — `if EquipmentManager_UnpackLocation ~= nil then UpdatePreMidnight() else
+UpdateMidnight() end`. This keeps every client that works today byte-for-byte unchanged (War
+Within retail and the classic-retail variants BCC/Cata/Mists all still have `UnpackLocation`,
+including the `not addon.isRetail` void-bank slot shift) and routes both Midnight **and** Forever
+to the `GetLocationData` path. `addon.isMidnight` is no longer the discriminator for equipment
+sets (it remains defined; it has no other consumer). Coverage: `spec/equipmentsets_spec.lua`
+("Update" describe — UnpackLocation-present path, UnpackLocation-absent Midnight path, and the
+"does not crash on Forever (retail, non-midnight, no UnpackLocation)" regression).
+
+## 7. Camelot bank container model — the bank is the purchased CharacterBankTab_N; -1 is the KEYRING (do not add it)
+
+Definitive container map on Camelot (verified live via a per-container `/run` dump plus the
+`origin/forever` source):
+
+- **Character bank storage = the purchased tabs `CharacterBankTab_1..9` = bag ids 6..14.** The
+  first character tab is auto-granted free (`BankFrameMixin:PurchaseFirstSlot`,
+  `Blizzard_UIPanels_Game/Camelot/BankFrame.lua` — `tabCost == 0` ⇒ auto `PurchaseBankTab`), the
+  rest are bought. `C_Bank.FetchPurchasedBankTabData(Enum.BankType.Character)` returns the
+  purchased tabs' container ids (6, then 7…). BetterBags already scans these — they are in
+  `const.BANK_BAGS` (§2). A live dump showed `6: slots=48, free=48` for a character with one
+  48-slot tab, matching the player's hand-counted 48 free.
+- **`Characterbanktab` (-2) / `Accountbanktab` (-3) hold bank-BAG objects, not items** (addressed
+  `(Characterbanktab, bagSlotID)`); `GetContainerNumSlots(-2)` is 0. Harmless in `BANK_BAGS`
+  (skipped by the `size > 0` guard), same as live retail.
+- **Bag id -1 is the KEYRING, NOT the bank.** `origin/forever:Blizzard_FrameXMLBase/Constants.lua`
+  sets `KEYRING_CONTAINER = Enum.BagIndex.Keyring` and the enum has `Keyring = -1`; Camelot is
+  Wrath-era and has a working keyring (`Blizzard_MainMenuBarBagButtons/Camelot/MainMenuBarBagButtons.lua`
+  `GetKeyRingSize()` → `GetContainerNumSlots(-1)`). It persistently reports ~32 slots whether or
+  not you are at the bank.
+
+**Do NOT add -1 to `const.BANK_BAGS`.** A prior fix misread an empty-bank dump (which, at 0
+purchased tabs, showed only `-1: 32` because the free first tab hadn't been granted/loaded yet)
+and concluded -1 was the "base bank." Adding it made the aggregate free-space counter read
+`keyring(32) + bank(48) = 80` when the real bank was 48, and would have surfaced 32 keyring slots
+as bank space. That change (and its `not addon.isForever` keyring-guard edits in `data/items.lua`)
+was reverted. The keyring guards in `Phase5_UpdateFreeSlots`/`Phase6_EnrichData`/`GetBagName`
+(`bagid == Enum.BagIndex.Keyring`) are correct as-is: -1 is not in `BACKPACK_BAGS` or `BANK_BAGS`,
+so it is simply never scanned.
+
+If a Camelot bank ever renders blank with tabs that *do* have slots, the cause is the async
+first-tab grant/load not being reflected at the `BANKFRAME_OPENED` scan (there is no retail
+re-scan on `BANK_TABS_CHANGED`), **not** a missing base-bank container — diagnose that path
+rather than re-adding -1.
+
+## 8. Still pending (not yet done)
 
 - The three new `C_Bank` functions on Camelot (`ShouldUsePlayerBagsInBank`,
   `FetchMaxNumBankTabs`, `BankBagTypeAndIDToInvSlot`) are net-new integration points; none
